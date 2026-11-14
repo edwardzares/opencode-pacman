@@ -13,6 +13,19 @@ const OPPOSITE = { left: 'right', right: 'left', up: 'down', down: 'up' };
 const PACMAN_SPEED = 0.125; // 1/8 celda/frame -> alinea cada 8 frames
 const GHOST_SPEED = 0.1;    // 1/10 celda/frame
 
+const SCATTER_MS = 7000;      // 7 s de dispersion
+const CHASE_MS = 20000;       // 20 s de persecucion
+const PINKY_LEAD = 4;         // celdas de anticipacion de pinky
+const INKY_LEAD = 2;          // celdas de anticipacion de inky
+const CLYDE_PANIC_DISTANCE = 8; // distancia a la que clyde se retira
+
+const GHOST_CORNERS = {
+  blinky: { x: 26, y: 1 },  // arriba-derecha
+  pinky:  { x: 1,  y: 1 },  // arriba-izquierda
+  inky:   { x: 26, y: 29 }, // abajo-derecha
+  clyde:  { x: 1,  y: 29 }, // abajo-izquierda
+};
+
 // Crea una partida nueva. Copia MAZE (pristino) a game.grid para poder comer
 // dots sin destruir el original, y reiniciar.
 function createGame() {
@@ -29,6 +42,9 @@ function createGame() {
     lives: 3,
     dotsRemaining: dots,
     grid,
+    phase: 'scatter',
+    phaseTimeMs: 0,
+    lastTickMs: performance.now(),
     pacman: {
       x: PACMAN_START.x,
       y: PACMAN_START.y,
@@ -110,9 +126,58 @@ function movePacman( game ) {
   wrapTunnel( p, width );
 }
 
+// Un fantasma esta dentro de la pen (interior x 11-16, y 13-15) o en la
+// puerta (y 12). La unica salida es hacia arriba, por la puerta.
+function insidePen( g ) {
+  const gx = Math.round( g.x );
+  const gy = Math.round( g.y );
+  return gx >= 11 && gx <= 16 && gy >= 12 && gy <= 15;
+}
+
+// Objetivo de persecucion segun la personalidad del fantasma.
+// El objetivo puede caer en pared o fuera de la rejilla: solo sirve para
+// comparar distancias Manhattan desde las celdas vecinas transitables.
+function targetFor( game, g ) {
+  const p = game.pacman;
+  const px = Math.round( p.x );
+  const py = Math.round( p.y );
+  const d = DIRS[ p.dir ];
+
+  // Salir de la pen antes de aplicar personalidad o esquina de dispersion.
+  // Se apunta por encima de la puerta para no quedarse rebotando en ella.
+  if ( insidePen( g ) ) return { x: 13, y: 11 };
+
+  // En dispersion cada fantasma se refugia en su propia esquina.
+  if ( game.phase === 'scatter' ) return GHOST_CORNERS[ g.kind ];
+
+  if ( g.kind === 'pinky' ) {
+    return { x: px + d.x * PINKY_LEAD, y: py + d.y * PINKY_LEAD };
+  }
+
+  if ( g.kind === 'inky' ) {
+    const aheadX = px + d.x * INKY_LEAD;
+    const aheadY = py + d.y * INKY_LEAD;
+    const blinky = game.ghosts.find( ( other ) => other.kind === 'blinky' );
+    if ( !blinky ) return { x: px, y: py };
+    const bx = Math.round( blinky.x );
+    const by = Math.round( blinky.y );
+    return { x: 2 * aheadX - bx, y: 2 * aheadY - by };
+  }
+
+  if ( g.kind === 'clyde' ) {
+    const gx = Math.round( g.x );
+    const gy = Math.round( g.y );
+    const dist = Math.abs( gx - px ) + Math.abs( gy - py );
+    if ( dist > CLYDE_PANIC_DISTANCE ) return { x: px, y: py };
+    return GHOST_CORNERS.clyde;
+  }
+
+  // blinky: celda actual de Pac-Man.
+  return { x: px, y: py };
+}
+
 function decideGhost( game, g ) {
   const grid = game.grid;
-  const p = game.pacman;
 
   const options = Object.keys( DIRS ).filter(
     ( dir ) => dir !== OPPOSITE[ g.dir ] && canMove( grid, g.x, g.y, dir, 'ghost' )
@@ -120,25 +185,20 @@ function decideGhost( game, g ) {
   // Sin salida (callejon): permitir el giro de 180.
   const choices = options.length ? options : [ '' + OPPOSITE[ g.dir ] ];
 
-  if ( g.kind === 'hunter' ) {
-    const px = Math.round( p.x );
-    const py = Math.round( p.y );
-    let best = choices[ 0 ];
-    let bestDist = Infinity;
-    for ( const dir of choices ) {
-      const d = DIRS[ dir ];
-      const nx = g.x + d.x;
-      const ny = g.y + d.y;
-      const dist = Math.abs( nx - px ) + Math.abs( ny - py );
-      if ( dist < bestDist ) {
-        bestDist = dist;
-        best = dir;
-      }
+  const target = targetFor( game, g );
+  let best = choices[ 0 ];
+  let bestDist = Infinity;
+  for ( const dir of choices ) {
+    const d = DIRS[ dir ];
+    const nx = g.x + d.x;
+    const ny = g.y + d.y;
+    const dist = Math.abs( nx - target.x ) + Math.abs( ny - target.y );
+    if ( dist < bestDist ) {
+      bestDist = dist;
+      best = dir;
     }
-    g.dir = best;
-  } else {
-    g.dir = choices[ Math.floor( Math.random() * choices.length ) ];
   }
+  g.dir = best;
 }
 
 function moveGhost( game, g ) {
@@ -159,6 +219,10 @@ function moveGhost( game, g ) {
 }
 
 function resetPositions( game ) {
+  game.phase = 'scatter';
+  game.phaseTimeMs = 0;
+  game.lastTickMs = performance.now();
+
   const p = game.pacman;
   p.x = PACMAN_START.x;
   p.y = PACMAN_START.y;
@@ -175,7 +239,26 @@ function collides( a, b ) {
   return Math.abs( a.x - b.x ) < 0.5 && Math.abs( a.y - b.y ) < 0.5;
 }
 
+// Avanza el temporizador de fase con delta real (independiente del refresco).
+// El delta se limita a 100 ms para evitar saltos tras ocultar la pestana.
+function advancePhase( game ) {
+  const now = performance.now();
+  let delta = now - game.lastTickMs;
+  game.lastTickMs = now;
+  if ( delta > 100 ) delta = 100;
+  game.phaseTimeMs += delta;
+
+  if ( game.phase === 'scatter' && game.phaseTimeMs >= SCATTER_MS ) {
+    game.phase = 'chase';
+    game.phaseTimeMs = 0;
+  } else if ( game.phase === 'chase' && game.phaseTimeMs >= CHASE_MS ) {
+    game.phase = 'scatter';
+    game.phaseTimeMs = 0;
+  }
+}
+
 function update( game ) {
+  advancePhase( game );
   movePacman( game );
   game.ghosts.forEach( ( g ) => moveGhost( game, g ) );
 

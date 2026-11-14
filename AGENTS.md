@@ -1,10 +1,11 @@
 # AGENTS.md
 
-Pac-Man clone in vanilla JS/HTML/CSS, used as a practice project for spec-driven development. No framework, bundler, package manager, linter, or automated tests.
+Pac-Man clone in vanilla JS/HTML/CSS, used as a practice project for spec-driven development. No framework, bundler, package manager, or linter. Tests use Node's built-in runner with no dependencies.
 
 ## Run and verify
 
 - Open `src/index.html` directly in a browser; no server or build step is needed. On Windows: `start src/index.html`.
+- Automated tests: `node --test tests/` (Node 18+). They load `maze.js`, `game.js` and `render.js` into a Node `vm` context with stubbed browser globals, so no DOM or install step is required.
 - Verification is manual: Start button hides the overlay, arrow keys move Pac-Man, dots add 10 points, row 14 wraps horizontally, 3 collisions end the game, clearing all dots wins.
 - Do not add npm/tooling scaffolding unless the user asks; there is no `package.json` and nothing to install.
 
