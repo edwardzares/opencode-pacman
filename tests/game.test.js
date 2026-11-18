@@ -40,9 +40,12 @@ function loadGame( now = () => 0 ) {
   vm.runInContext(
     `window.__t = {
       createGame, update, targetFor, insidePen, advancePhase, resetPositions,
-      decideGhost, moveGhost, collides,
-      GHOST_STARTS, GHOST_CORNERS, SCATTER_MS, CHASE_MS,
-      PINKY_LEAD, INKY_LEAD, CLYDE_PANIC_DISTANCE
+      decideGhost, moveGhost, collides, activatePower, endPower, ghostChoices,
+      eyesTarget, tickDelta,
+      GHOST_STARTS, GHOST_CORNERS, SCATTER_MS, CHASE_MS, GHOST_SPEED, DIRS,
+      PINKY_LEAD, INKY_LEAD, CLYDE_PANIC_DISTANCE,
+      POWER_DURATION_MS, POWER_BLINK_MS, POWER_BLINK_FRAMES, POWER_SCORE,
+      GHOST_SCORE_CHAIN, FRIGHTENED_SPEED, EYES_SPEED, POWER_PEN_TARGET, MAZE
     };`,
     sandbox
   );
@@ -55,7 +58,14 @@ function loadRender( now = () => 0 ) {
   run( sandbox, FILES.maze );
   run( sandbox, FILES.game );
   run( sandbox, FILES.render );
-  vm.runInContext( `window.__r = { GHOST_COLORS, draw, createGame };`, sandbox );
+  vm.runInContext(
+    `window.__r = {
+      GHOST_COLORS, draw, createGame, ghostColor,
+      FRIGHTENED_COLOR, BLINK_COLOR, POWER_COLOR,
+      POWER_BLINK_MS, POWER_BLINK_FRAMES
+    };`,
+    sandbox
+  );
   return sandbox.__r;
 }
 
@@ -63,6 +73,7 @@ function loadRender( now = () => 0 ) {
 function fakeCtx() {
   return {
     fills: [],
+    arcs: [],
     fillStyle: '',
     strokeStyle: '',
     lineWidth: 0,
@@ -80,9 +91,17 @@ function fakeCtx() {
     },
     moveTo() {},
     lineTo() {},
-    arc() {},
+    arc( x, y, r ) {
+      this.arcs.push( r );
+    },
     fillText() {},
   };
+}
+
+const PELLET_CELLS = [ [ 1, 1 ], [ 26, 1 ], [ 1, 29 ], [ 26, 29 ] ];
+
+function clearPellets( game ) {
+  for ( const [ x, y ] of PELLET_CELLS ) game.grid[ y ][ x ] = 0;
 }
 
 test( 'GHOST_STARTS define los cuatro fantasmas con identidad fija', () => {
@@ -539,5 +558,523 @@ test( 'se dibujan cuatro fantasmas con un color distinto por identidad', () => {
       1,
       kind
     );
+  }
+} );
+
+test( 'MAZE tiene exactamente cuatro pellets en las esquinas y no se muta', () => {
+  const t = loadGame();
+  const cells = [];
+  t.MAZE.forEach( ( row, y ) => {
+    row.forEach( ( v, x ) => {
+      if ( v === 4 ) cells.push( [ x, y ] );
+    } );
+  } );
+
+  assert.deepEqual( cells, PELLET_CELLS );
+
+  const game = t.createGame();
+  assert.equal( game.grid[ 1 ][ 1 ], 4 );
+  game.grid[ 1 ][ 1 ] = 0;
+  assert.equal( t.MAZE[ 1 ][ 1 ], 4, 'MAZE debe seguir pristino' );
+} );
+
+test( 'createGame cuenta solo dots para ganar y prepara los pellets del modo', () => {
+  const t = loadGame();
+  const game = t.createGame();
+  const count = ( grid, value ) => grid.reduce(
+    ( n, row ) => n + row.filter( ( v ) => v === value ).length,
+    0
+  );
+
+  // La celda de inicio de Pac-Man tenia dot y createGame la deja vacia.
+  assert.equal( game.dotsRemaining, count( t.MAZE, 2 ) - 1 );
+  assert.equal( game.dotsRemaining, count( game.grid, 2 ) );
+  assert.equal( game.pelletsRemaining, 4 );
+  assert.equal( game.powerTimeMs, 0 );
+  assert.equal( game.ghostCombo, 0 );
+} );
+
+test( 'comer un power pellet suma 50, vacia la celda y activa 10 s', () => {
+  let now = 0;
+  const t = loadGame( () => now );
+  const game = t.createGame();
+  game.state = 'playing';
+  game.dotsRemaining = 1000;
+  game.ghosts = [];
+  game.pacman.x = 2;
+  game.pacman.y = 1;
+  game.pacman.dir = 'left';
+  game.pacman.nextDir = null;
+  game.grid[ 1 ][ 2 ] = 0; // solo queremos medir el pellet, no el dot previo
+
+  for ( let i = 0; i < 10 && game.grid[ 1 ][ 1 ] === 4; i++ ) {
+    now += 16;
+    t.update( game );
+  }
+
+  assert.equal( game.grid[ 1 ][ 1 ], 0 );
+  assert.equal( game.score, t.POWER_SCORE );
+  assert.equal( game.pelletsRemaining, 3 );
+  assert.equal( game.powerTimeMs, t.POWER_DURATION_MS );
+} );
+
+test( 'activatePower invierte solo a los fantasmas fuera de la pen', () => {
+  const t = loadGame();
+  const game = t.createGame();
+  const outside = game.ghosts[ 0 ];
+  outside.x = 10;
+  outside.y = 5;
+  outside.dir = 'right';
+  outside.mode = 'normal';
+
+  t.activatePower( game );
+
+  assert.equal( outside.mode, 'frightened' );
+  assert.equal( outside.dir, 'left' );
+  assert.equal( outside.speed, t.FRIGHTENED_SPEED );
+  for ( const g of game.ghosts.slice( 1 ) ) {
+    assert.equal( g.mode, 'pen', g.kind );
+    assert.equal( g.speed, t.GHOST_SPEED, g.kind );
+  }
+} );
+
+test( 'comer otro pellet suma tiempo y conserva la cadena de puntos', () => {
+  let now = 0;
+  const t = loadGame( () => now );
+  const game = t.createGame();
+  game.state = 'playing';
+  game.dotsRemaining = 1000;
+  game.ghosts = [];
+  game.powerTimeMs = 3000;
+  game.ghostCombo = 2;
+  game.pacman.x = 25.875;
+  game.pacman.y = 1;
+  game.pacman.dir = 'right';
+  game.pacman.nextDir = null;
+
+  // Dos frames sin delta: el primero alinea y el segundo come la celda 4.
+  t.update( game );
+  t.update( game );
+
+  assert.equal( game.grid[ 1 ][ 26 ], 0 );
+  assert.equal( game.score, t.POWER_SCORE );
+  assert.equal( game.pelletsRemaining, 3 );
+  assert.equal( game.powerTimeMs, 3000 + t.POWER_DURATION_MS );
+  assert.equal( game.ghostCombo, 2, 'la cadena no debe reiniciarse' );
+} );
+
+test( 'los asustados eligen al azar entre las direcciones validas y van a 0.05', () => {
+  const t = loadGame();
+  const game = t.createGame();
+  const ghost = game.ghosts[ 0 ];
+  ghost.x = 6;
+  ghost.y = 5;
+  ghost.dir = 'right';
+  ghost.mode = 'frightened';
+  ghost.speed = t.FRIGHTENED_SPEED;
+
+  const choices = t.ghostChoices( game, ghost );
+  assert.ok( choices.length > 1 );
+  assert.ok( !choices.includes( 'left' ), 'no puede girar 180 sin callejon' );
+
+  const originalRandom = Math.random;
+  try {
+    const picked = [];
+    for ( const value of [ 0, 0.99 ] ) {
+      ghost.x = 6;
+      ghost.y = 5;
+      ghost.dir = 'right';
+      Math.random = () => value;
+      t.moveGhost( game, ghost );
+      picked.push( ghost.dir );
+      const d = t.DIRS[ ghost.dir ];
+      assert.ok( Math.abs( ghost.x - ( 6 + d.x * t.FRIGHTENED_SPEED ) ) < 1e-9 );
+      assert.ok( Math.abs( ghost.y - ( 5 + d.y * t.FRIGHTENED_SPEED ) ) < 1e-9 );
+    }
+    assert.equal( picked[ 0 ], choices[ 0 ] );
+    assert.notEqual( picked[ 0 ], picked[ 1 ], 'Math.random debe elegir otra salida' );
+  } finally {
+    Math.random = originalRandom;
+  }
+} );
+
+test( 'comer cuatro asustados suma 200/400/800/1600 sin quitar vidas', () => {
+  let now = 0;
+  const t = loadGame( () => now );
+  const game = t.createGame();
+  game.state = 'playing';
+  game.dotsRemaining = 1000;
+  game.powerTimeMs = 5000;
+  game.pacman.x = 20;
+  game.pacman.y = 20;
+  game.pacman.speed = 0;
+  game.grid[ 20 ][ 20 ] = 0;
+  game.ghosts.forEach( ( g ) => {
+    g.x = 20;
+    g.y = 20;
+    g.dir = 'right';
+    g.mode = 'frightened';
+    g.speed = t.FRIGHTENED_SPEED;
+  } );
+
+  for ( let i = 0; i < 4; i++ ) {
+    now += 16;
+    t.update( game );
+  }
+
+  assert.equal( game.score, 200 + 400 + 800 + 1600 );
+  assert.equal( game.lives, 3 );
+  assert.equal( game.ghostCombo, 4 );
+  for ( const g of game.ghosts ) {
+    assert.equal( g.mode, 'eyes', g.kind );
+    assert.equal( g.speed, t.EYES_SPEED, g.kind );
+  }
+} );
+
+test( 'los ojos esperan dentro de la pen y vuelven a ser fantasmas al terminar', () => {
+  let now = 0;
+  const t = loadGame( () => now );
+  const game = t.createGame();
+  game.state = 'playing';
+  game.dotsRemaining = 1000;
+  game.powerTimeMs = 2000;
+  game.pacman.x = 1;
+  game.pacman.y = 29;
+  game.pacman.speed = 0;
+  game.grid[ 29 ][ 1 ] = 0;
+
+  const eyes = game.ghosts[ 0 ]; // blinky: su celda de la pen es (13,14)
+  eyes.x = 13;
+  eyes.y = 11;
+  eyes.dir = 'down';
+  eyes.mode = 'eyes';
+  eyes.speed = t.EYES_SPEED;
+  game.ghosts = [ eyes ];
+
+  // Atraviesa la puerta y sigue hasta el interior; no se queda en la fila 12.
+  for ( let i = 0; i < 20 && ( eyes.x !== 13 || eyes.y !== 14 ); i++ ) {
+    now += 16;
+    t.update( game );
+  }
+  assert.equal( eyes.x, 13 );
+  assert.equal( eyes.y, 14, 'debe esperar dentro de la pen, no en la puerta' );
+  assert.equal( eyes.mode, 'eyes' );
+  assert.equal( eyes.speed, t.EYES_SPEED );
+
+  for ( let i = 0; i < 3; i++ ) {
+    now += 16;
+    t.update( game );
+  }
+  assert.equal( eyes.x, 13 );
+  assert.equal( eyes.y, 14, 'no debe moverse mientras haya poder' );
+  assert.equal( eyes.mode, 'eyes' );
+
+  for ( let i = 0; i < 30 && game.powerTimeMs > 0; i++ ) {
+    now += 100;
+    t.update( game );
+  }
+  assert.equal( game.powerTimeMs, 0 );
+  now += 16;
+  t.update( game );
+
+  assert.equal( eyes.mode, 'leaving', 'recupera el cuerpo y empieza a salir' );
+  assert.equal( eyes.speed, t.GHOST_SPEED );
+
+  for ( let i = 0; i < 60 && eyes.mode === 'leaving'; i++ ) {
+    now += 16;
+    t.update( game );
+  }
+  assert.equal( eyes.mode, 'normal' );
+  assert.equal( t.insidePen( eyes ), false );
+} );
+
+test( 'el poder congela scatter/chase y el reloj sigue desde el mismo punto', () => {
+  let now = 0;
+  const t = loadGame( () => now );
+  const game = t.createGame();
+  game.state = 'playing';
+  game.dotsRemaining = 1000;
+  game.ghosts = [];
+  game.pacman.speed = 0;
+  game.phaseTimeMs = 5000;
+  game.powerTimeMs = 3000;
+
+  for ( let i = 0; i < 10; i++ ) {
+    now += 16;
+    t.update( game );
+  }
+  assert.equal( game.phaseTimeMs, 5000 );
+  assert.equal( game.powerTimeMs, 3000 - 160 );
+
+  game.powerTimeMs = 50;
+  now += 100;
+  t.update( game );
+  assert.equal( game.powerTimeMs, 0 );
+  assert.equal( game.phaseTimeMs, 5000 );
+
+  now += 16;
+  t.update( game );
+  assert.equal( game.phaseTimeMs, 5016 );
+} );
+
+test( 'perder una vida cancela el poder y devuelve todos los fantasmas', () => {
+  let now = 0;
+  const t = loadGame( () => now );
+  const game = t.createGame();
+  game.state = 'playing';
+  game.dotsRemaining = 1000;
+  game.powerTimeMs = 3000;
+  game.ghostCombo = 2;
+  game.pacman.x = 20;
+  game.pacman.y = 20;
+  game.pacman.speed = 0;
+  game.grid[ 20 ][ 20 ] = 0;
+
+  const killer = game.ghosts[ 0 ];
+  killer.x = 20;
+  killer.y = 20;
+  killer.dir = 'right';
+  killer.mode = 'normal';
+  killer.speed = 0;
+  for ( const g of game.ghosts.slice( 1 ) ) {
+    g.x = 1;
+    g.y = 1;
+    g.mode = 'frightened';
+    g.speed = t.FRIGHTENED_SPEED;
+  }
+
+  now += 16;
+  t.update( game );
+
+  assert.equal( game.lives, 2 );
+  assert.equal( game.powerTimeMs, 0 );
+  assert.equal( game.ghostCombo, 0 );
+  for ( const g of game.ghosts ) {
+    assert.equal( g.mode, 'pen', g.kind );
+    assert.equal( g.speed, t.GHOST_SPEED, g.kind );
+    assert.equal( t.insidePen( g ), true, g.kind );
+  }
+} );
+
+test( 'ganar solo requiere dots, aunque queden power pellets', () => {
+  let now = 0;
+  const t = loadGame( () => now );
+  const game = t.createGame();
+  game.state = 'playing';
+  game.dotsRemaining = 1;
+  game.ghosts = [];
+  game.pacman.x = 2;
+  game.pacman.y = 1;
+  game.pacman.dir = 'left';
+  game.pacman.nextDir = null;
+
+  now += 16;
+  t.update( game );
+
+  assert.equal( game.state, 'won' );
+  assert.equal( game.score, 10 );
+  assert.equal( game.pelletsRemaining, 4 );
+} );
+
+test( 'los pellets se dibujan grandes y alternan color con el frame', () => {
+  const r = loadRender();
+  const game = r.createGame();
+  game.ghosts = [];
+
+  const withPellets = fakeCtx();
+  r.draw( withPellets, game, 0 );
+  assert.equal( withPellets.arcs.filter( ( rad ) => rad === 6 ).length, 4 );
+
+  const yellow = ( ctx ) => ctx.fills.filter( ( c ) => c === r.POWER_COLOR ).length;
+  const withYellow = yellow( withPellets );
+  clearPellets( game );
+  const withoutPellets = fakeCtx();
+  r.draw( withoutPellets, game, 0 );
+  assert.equal( withYellow - yellow( withoutPellets ), 4 );
+
+  const blinkGame = r.createGame();
+  blinkGame.ghosts = [];
+  const blinking = fakeCtx();
+  r.draw( blinking, blinkGame, r.POWER_BLINK_FRAMES );
+  assert.equal(
+    blinking.fills.filter( ( c ) => c === r.BLINK_COLOR ).length,
+    4
+  );
+} );
+
+test( 'los asustados son azules y parpadean blanco en los ultimos 2 s', () => {
+  const r = loadRender();
+  const game = r.createGame();
+  clearPellets( game );
+  game.ghosts.forEach( ( g ) => {
+    g.mode = 'frightened';
+    g.x = 20;
+    g.y = 20;
+  } );
+  const ghost = game.ghosts[ 0 ];
+
+  game.powerTimeMs = 5000;
+  let ctx = fakeCtx();
+  r.draw( ctx, game, r.POWER_BLINK_FRAMES );
+  assert.equal( r.ghostColor( game, ghost, r.POWER_BLINK_FRAMES ), r.FRIGHTENED_COLOR );
+  assert.ok( ctx.fills.includes( r.FRIGHTENED_COLOR ) );
+  assert.ok( !ctx.fills.includes( r.BLINK_COLOR ) );
+
+  game.powerTimeMs = r.POWER_BLINK_MS + 1;
+  assert.equal( r.ghostColor( game, ghost, r.POWER_BLINK_FRAMES ), r.FRIGHTENED_COLOR );
+
+  game.powerTimeMs = r.POWER_BLINK_MS;
+  ctx = fakeCtx();
+  r.draw( ctx, game, r.POWER_BLINK_FRAMES );
+  assert.equal( r.ghostColor( game, ghost, r.POWER_BLINK_FRAMES ), r.BLINK_COLOR );
+  assert.equal( ctx.fills.filter( ( c ) => c === r.BLINK_COLOR ).length, 4 );
+
+  ghost.mode = 'normal';
+  assert.equal( r.ghostColor( game, ghost, r.POWER_BLINK_FRAMES ), r.GHOST_COLORS.blinky );
+} );
+
+test( 'los ojos se dibujan sin cuerpo', () => {
+  const r = loadRender();
+  const game = r.createGame();
+  clearPellets( game );
+  game.ghosts.forEach( ( g ) => {
+    g.mode = 'eyes';
+    g.x = 20;
+    g.y = 20;
+  } );
+
+  const ctx = fakeCtx();
+  r.draw( ctx, game, 0 );
+
+  // Solo el cuerpo de Pac-Man conserva el radio 9; los fantasmas no lo usan.
+  assert.equal( ctx.arcs.filter( ( rad ) => rad === 9 ).length, 1 );
+  for ( const kind of [ 'blinky', 'pinky', 'inky', 'clyde' ] ) {
+    assert.equal( ctx.fills.filter( ( c ) => c === r.GHOST_COLORS[ kind ] ).length, 0 );
+  }
+  assert.equal( ctx.fills.filter( ( c ) => c === '#0000bb' ).length, 8 );
+} );
+
+test( 'al terminar el poder en mitad de celda, el fantasma se alinea y no sale del tablero', () => {
+  let now = 0;
+  const t = loadGame( () => now );
+  const game = t.createGame();
+  game.state = 'playing';
+  game.dotsRemaining = 1000;
+  game.pacman.x = 1;
+  game.pacman.y = 29;
+  game.pacman.speed = 0;
+  game.grid[ 29 ][ 1 ] = 0;
+
+  const ghost = {
+    x: 6.25,
+    y: 5,
+    dir: 'right',
+    mode: 'frightened',
+    speed: t.FRIGHTENED_SPEED,
+    kind: 'blinky',
+    exitCol: 13,
+    penDelay: 0,
+  };
+  game.ghosts = [ ghost ];
+  game.powerTimeMs = 50; // el siguiente frame agota el poder
+
+  now += 100;
+  t.update( game );
+
+  assert.equal( ghost.speed, t.GHOST_SPEED );
+  const alignedTo = ( v, step ) => Math.abs( v / step - Math.round( v / step ) ) < 1e-3;
+  assert.ok( alignedTo( ghost.x, t.GHOST_SPEED ), 'x debe quedar multiple de 0.1' );
+  assert.ok( alignedTo( ghost.y, t.GHOST_SPEED ), 'y debe quedar multiple de 0.1' );
+
+  let turned = false;
+  for ( let i = 0; i < 400; i++ ) {
+    now += 16;
+    t.update( game );
+    if ( ghost.dir !== 'right' ) turned = true;
+    assert.ok( ghost.x >= 0 && ghost.x < 28, 'x fuera del tablero: ' + ghost.x );
+    assert.ok( ghost.y >= 0 && ghost.y < 31, 'y fuera del tablero: ' + ghost.y );
+  }
+  assert.equal( turned, true, 'debe volver a decidir direccion en una celda' );
+} );
+
+test( 'comer un asustado en mitad de celda alinea los ojos y llegan a la pen', () => {
+  let now = 0;
+  const t = loadGame( () => now );
+  const game = t.createGame();
+  game.state = 'playing';
+  game.dotsRemaining = 1000;
+  game.powerTimeMs = 5000;
+  game.pacman.x = 20;
+  game.pacman.y = 20;
+  game.pacman.speed = 0;
+  game.grid[ 20 ][ 20 ] = 0;
+
+  const ghost = {
+    x: 20.25,
+    y: 20,
+    dir: 'right',
+    mode: 'frightened',
+    speed: t.FRIGHTENED_SPEED,
+    kind: 'blinky',
+    exitCol: 13,
+    penDelay: 0,
+  };
+  game.ghosts = [ ghost ];
+
+  now += 16;
+  t.update( game );
+
+  assert.equal( ghost.mode, 'eyes' );
+  assert.equal( ghost.speed, t.EYES_SPEED );
+  assert.ok( Number.isInteger( ghost.x ), 'x debe alinearse al pasar a 0.2' );
+  assert.ok( Number.isInteger( ghost.y ), 'y debe alinearse al pasar a 0.2' );
+
+  game.powerTimeMs = 100000;
+  for ( let i = 0; i < 300 && !t.insidePen( ghost ); i++ ) {
+    now += 16;
+    t.update( game );
+    assert.ok( ghost.x >= 0 && ghost.x < 28, 'ojos fuera del tablero' );
+    assert.ok( ghost.y >= 0 && ghost.y < 31, 'ojos fuera del tablero' );
+  }
+  assert.equal( t.insidePen( ghost ), true, 'los ojos deben llegar a la pen' );
+} );
+
+test( 'cada ojos espera en su celda interior sin apilarse en la puerta', () => {
+  let now = 0;
+  const t = loadGame( () => now );
+  const game = t.createGame();
+  game.state = 'playing';
+  game.dotsRemaining = 1000;
+  game.powerTimeMs = 100000;
+  game.pacman.x = 1;
+  game.pacman.y = 29;
+  game.pacman.speed = 0;
+  game.grid[ 29 ][ 1 ] = 0;
+
+  game.ghosts.forEach( ( g ) => {
+    g.x = 13;
+    g.y = 11;
+    g.dir = 'down';
+    g.mode = 'eyes';
+    g.speed = t.EYES_SPEED;
+  } );
+
+  const restOf = ( g ) => t.GHOST_STARTS.find( ( s ) => s.kind === g.kind );
+  const atRest = ( g ) => {
+    const rest = restOf( g );
+    return g.x === rest.x && g.y === rest.y;
+  };
+
+  for ( let i = 0; i < 120 && !game.ghosts.every( atRest ); i++ ) {
+    now += 16;
+    t.update( game );
+  }
+
+  assert.ok( game.ghosts.every( atRest ), 'todos deben llegar a su celda' );
+  const cells = game.ghosts.map( ( g ) => g.x + ',' + g.y );
+  assert.equal( new Set( cells ).size, 4, 'no deben superponerse: ' + cells.join( ' ' ) );
+  for ( const g of game.ghosts ) {
+    assert.ok( g.y >= 13, g.kind + ' no debe esperar en la puerta' );
+    assert.equal( g.mode, 'eyes' );
   }
 } );
