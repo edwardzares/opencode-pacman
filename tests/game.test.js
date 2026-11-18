@@ -437,6 +437,71 @@ test( 'los cuatro fantasmas salen de la pen y cambian de fase con el tiempo', ()
   assert.equal( game.phase, 'chase' );
 } );
 
+test( 'los cuatro fantasmas salen de la pen sin superponerse', () => {
+  let now = 0;
+  const t = loadGame( () => now );
+  const game = t.createGame();
+  game.state = 'playing';
+  game.lives = 99;
+  game.dotsRemaining = 1000;
+  // Pac-Man quieto y lejos para que nadie lo toque durante la salida.
+  game.pacman.x = 1;
+  game.pacman.y = 29;
+  game.pacman.dir = 'left';
+  game.pacman.speed = 0;
+
+  let frames = 0;
+  while ( frames < 120 && game.ghosts.some( ( g ) => g.mode !== 'normal' ) ) {
+    now += 16;
+    t.update( game );
+    frames++;
+    const cells = game.ghosts.map( ( g ) => Math.round( g.x ) + ',' + Math.round( g.y ) );
+    assert.equal( new Set( cells ).size, 4, 'frame ' + frames + ': ' + cells.join( ' ' ) );
+  }
+
+  for ( const g of game.ghosts ) {
+    assert.equal( g.mode, 'normal', g.kind + ' no termino de salir' );
+    assert.equal( t.insidePen( g ), false, g.kind + ' sigue en la pen' );
+  }
+} );
+
+test( 'un fantasma libre no atraviesa la puerta hacia la pen', () => {
+  const t = loadGame();
+  const game = t.createGame();
+  const ghost = game.ghosts[ 0 ];
+  ghost.x = 13;
+  ghost.y = 11;
+  ghost.dir = 'down';
+  ghost.mode = 'normal';
+  // Objetivo debajo de la puerta: sin el bloqueo, bajaria a la pen.
+  game.phase = 'chase';
+  game.pacman.x = 13;
+  game.pacman.y = 20;
+  game.pacman.dir = 'up';
+
+  for ( let i = 0; i < 10; i++ ) t.moveGhost( game, ghost );
+
+  assert.ok( ghost.y <= 11, 'no debe bajar a la fila de la puerta' );
+  assert.equal( t.insidePen( ghost ), false );
+} );
+
+test( 'resetPositions deja a los fantasmas listos para salir otra vez', () => {
+  const t = loadGame();
+  const game = t.createGame();
+  for ( const g of game.ghosts ) {
+    g.mode = 'normal';
+    g.x = 5;
+    g.y = 5;
+  }
+
+  t.resetPositions( game );
+
+  for ( const g of game.ghosts ) {
+    assert.equal( g.mode, 'pen', g.kind + ' debe volver a la pen' );
+    assert.equal( t.insidePen( g ), true, g.kind + ' debe empezar en la pen' );
+  }
+} );
+
 test( 'el color de cada fantasma depende de su kind, no del indice', () => {
   const r = loadRender();
   const game = r.createGame();

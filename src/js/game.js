@@ -19,6 +19,23 @@ const PINKY_LEAD = 4;         // celdas de anticipacion de pinky
 const INKY_LEAD = 2;          // celdas de anticipacion de inky
 const CLYDE_PANIC_DISTANCE = 8; // distancia a la que clyde se retira
 
+// Salida de la pen. Cada fantasma usa una columna de la puerta y los dos que
+// empiezan en la fila superior esperan unos frames para no cruzarse con los
+// del centro (si no, quedan perfectamente superpuestos y parecen atrapados).
+const PEN_EXIT_ROW = 11;      // fila por encima de la puerta
+const PEN_EXIT_COL = {
+  blinky: 13,
+  pinky: 14,
+  inky: 13,
+  clyde: 14,
+};
+const PEN_EXIT_DELAY = {      // frames de espera dentro de la pen
+  blinky: 0,
+  pinky: 0,
+  inky: 20,
+  clyde: 20,
+};
+
 const GHOST_CORNERS = {
   blinky: { x: 26, y: 1 },  // arriba-derecha
   pinky:  { x: 1,  y: 1 },  // arriba-izquierda
@@ -58,6 +75,9 @@ function createGame() {
       dir: 'up',
       speed: GHOST_SPEED,
       kind: g.kind,
+      mode: 'pen',                       // 'pen' -> 'leaving' -> 'normal'
+      exitCol: PEN_EXIT_COL[ g.kind ],
+      penDelay: PEN_EXIT_DELAY[ g.kind ],
     } ) ),
   };
 }
@@ -68,25 +88,26 @@ function aligned( v ) {
 
 // Una celda es muro para el actor dado?
 //   pacman: bloqueado por pared (1) y puerta (3)
-//   ghost:  bloqueado solo por pared (1)
-function isWall( grid, x, y, actor ) {
+//   ghost:  bloqueado por pared (1); la puerta (3) solo se abre para quien
+//           esta saliendo de la pen (mode 'leaving'), asi no puede reentrar.
+function isWall( grid, x, y, actor, doorOpen ) {
   if ( y < 0 || y >= grid.length ) return true;
   if ( x < 0 || x >= grid[ 0 ].length ) return true;
   const v = grid[ y ][ x ];
   if ( v === 1 ) return true;
-  if ( v === 3 && actor === 'pacman' ) return true;
+  if ( v === 3 && ( actor === 'pacman' || !doorOpen ) ) return true;
   return false;
 }
 
 // Puede el actor avanzar desde (x,y) en la direccion dir?
-function canMove( grid, x, y, dir, actor ) {
+function canMove( grid, x, y, dir, actor, doorOpen ) {
   const d = DIRS[ dir ];
   if ( !d ) return false;
   const tx = x + d.x;
   const ty = y + d.y;
   // Tunel: salir por un borde en la fila del tunel siempre es valido.
   if ( ty === TUNNEL_ROW && ( tx < 0 || tx >= grid[ 0 ].length ) ) return true;
-  return !isWall( grid, tx, ty, actor );
+  return !isWall( grid, tx, ty, actor, doorOpen );
 }
 
 function wrapTunnel( a, width ) {
@@ -208,8 +229,35 @@ function moveGhost( game, g ) {
   if ( aligned( g.x ) && aligned( g.y ) ) {
     g.x = Math.round( g.x );
     g.y = Math.round( g.y );
-    decideGhost( game, g );
-    if ( !canMove( grid, g.x, g.y, g.dir, 'ghost' ) ) return;
+
+    // Si por algun motivo esta fuera de la pen, la salida ya no aplica.
+    if ( g.mode === 'pen' && !insidePen( g ) ) g.mode = 'normal';
+
+    // Espera inicial dentro de la pen para no salir pisando a otro.
+    if ( g.mode === 'pen' ) {
+      if ( g.penDelay > 0 ) {
+        g.penDelay--;
+        return;
+      }
+      g.mode = 'leaving';
+    }
+
+    // Al superar la puerta vuelve al comportamiento normal.
+    if ( g.mode === 'leaving' && g.y <= PEN_EXIT_ROW ) {
+      g.mode = 'normal';
+    }
+
+    if ( g.mode === 'leaving' ) {
+      // Ruta forzada: primero a la columna de salida, luego hacia arriba.
+      if ( g.x < g.exitCol ) g.dir = 'right';
+      else if ( g.x > g.exitCol ) g.dir = 'left';
+      else g.dir = 'up';
+    } else {
+      decideGhost( game, g );
+    }
+
+    // La puerta solo esta abierta mientras el fantasma esta saliendo.
+    if ( !canMove( grid, g.x, g.y, g.dir, 'ghost', g.mode === 'leaving' ) ) return;
   }
 
   const d = DIRS[ g.dir ];
@@ -232,6 +280,9 @@ function resetPositions( game ) {
     g.x = GHOST_STARTS[ i ].x;
     g.y = GHOST_STARTS[ i ].y;
     g.dir = 'up';
+    g.mode = 'pen';
+    g.exitCol = PEN_EXIT_COL[ g.kind ];
+    g.penDelay = PEN_EXIT_DELAY[ g.kind ];
   } );
 }
 
